@@ -11,7 +11,6 @@
   { id: uint }
   {
     id: uint,
-    collateral-type: (string-ascii 10),
     collateral-amount: uint,
     debt-to-raise: uint,
     vault-id: uint,
@@ -21,6 +20,7 @@
     lots-sold: uint,
     is-open: bool,
     total-collateral-auctioned: uint,
+    total-debt-raised: uint,
     ends-at: uint
   }
 )
@@ -42,7 +42,6 @@
     (map-get? auctions { id: id })
     (tuple
       (id u0)
-      (collateral-type "")
       (collateral-amount u0)
       (debt-to-raise u0)
       (vault-id u0)
@@ -52,6 +51,7 @@
       (lots-sold u0)
       (is-open false)
       (total-collateral-auctioned u0)
+      (total-debt-raised u0)
       (ends-at u0)
     )
   )
@@ -80,7 +80,6 @@
           { id: auction-id }
           {
             id: auction-id,
-            collateral-type: "stx",
             collateral-amount: ustx-amount,
             debt-to-raise: debt-to-raise,
             vault-id: vault-id,
@@ -88,8 +87,9 @@
             lots: amount-of-lots,
             last-lot-size: last-lot,
             lots-sold: u0,
-            ends-at: (+ block-height u200),
+            ends-at: (+ block-height u10000),
             total-collateral-auctioned: u0,
+            total-debt-raised: u0,
             is-open: true
           }
         )
@@ -130,7 +130,6 @@
   )
 )
 
-;; TODO - check if bid is better than last bid, for simplicity we only save the last (best) bid
 (define-public (bid (auction-id uint) (lot-index uint) (xusd uint) (collateral-amount uint))
   (let ((auction (get-auction-by-id auction-id)))
     (if
@@ -139,82 +138,18 @@
         (is-eq (get is-open auction) true)
         (<= collateral-amount (/ (get collateral-amount auction) (get lots auction)))
       )
-      (ok (unwrap-panic (accept-bid auction-id lot-index xusd collateral-amount)))
+      (ok (register-bid auction-id lot-index xusd collateral-amount))
       (err err-bid-declined) ;; just silently exit
     )
   )
 )
 
-(define-private (accept-bid (auction-id uint) (lot-index uint) (xusd uint) (collateral-amount uint))
+(define-private (register-bid (auction-id uint) (lot-index uint) (xusd uint) (collateral-amount uint))
   (let ((auction (get-auction-by-id auction-id)))
     (let ((last-bid (get-last-bid auction-id lot-index)))
       (if (not (get is-accepted last-bid))
         (if (> xusd (get xusd last-bid)) ;; we have a better bid and the previous one was not accepted!
-          (begin
-            (if (>= xusd (/ (get debt-to-raise auction) (get lot-size auction)))
-              ;; if this bid is at least (total debt to raise / lot-size) amount, accept it as final - we don't need to be greedy
-              (begin
-                ;; send xUSD to auction-reserve. Return xUSD from last bid to highest bidder (if any)
-                (if (> u0 (get xusd last-bid))
-                  (unwrap-panic (as-contract (contract-call? .xusd-token transfer (get owner last-bid) (get xusd last-bid))))
-                  false
-                )
-                (if (unwrap-panic (contract-call? .xusd-token transfer auction-reserve xusd))
-                  (begin
-                    (map-set bids
-                      { auction-id: auction-id, lot-index: lot-index }
-                      {
-                        xusd: xusd,
-                        collateral-amount: collateral-amount,
-                        owner: tx-sender,
-                        is-accepted: true
-                      }
-                    )
-                    (map-set auctions
-                      { id: auction-id }
-                      {
-                        id: auction-id,
-                        collateral-type: "stx",
-                        collateral-amount: (get collateral-amount auction),
-                        debt-to-raise: (get debt-to-raise auction),
-                        vault-id: (get vault-id auction),
-                        lot-size: (get lot-size auction),
-                        lots: (get lots auction),
-                        last-lot-size: (get last-lot-size auction),
-                        lots-sold: (+ u1 (get lots-sold auction)),
-                        ends-at: (get ends-at auction),
-                        total-collateral-auctioned: (+ collateral-amount (get total-collateral-auctioned auction)),
-                        is-open: true
-                      }
-                    )
-                  )
-                  false
-                )
-                (if
-                  (and
-                    (>= block-height (get ends-at auction))
-                    (is-eq (get lots auction) (get lots-sold auction))
-                  )
-                  ;; auction is over - close all bids
-                  ;; send collateral to winning bidders
-                  (ok (unwrap-panic (close-auction auction-id)))
-                  (ok true)
-                )
-              )
-              (begin
-                (map-set bids
-                  { auction-id: auction-id, lot-index: lot-index }
-                  {
-                    xusd: xusd,
-                    collateral-amount: collateral-amount,
-                    owner: tx-sender,
-                    is-accepted: false
-                  }
-                )
-                (ok true)
-              )
-            )
-          )
+          (ok (accept-bid auction-id lot-index xusd collateral-amount))
           (err err-poor-bid) ;; don't care cause either the bid is already over or it was a poor bid
         )
         (err err-lot-sold) ;; lot is already sold
@@ -223,11 +158,73 @@
   )
 )
 
-;; 1. flag auction on map as closed
-;; 2. go over each lot (0 to lot-size) and send collateral to winning address
+(define-private (accept-bid (auction-id uint) (lot-index uint) (xusd uint) (collateral-amount uint))
+  (let ((auction (get-auction-by-id auction-id)))
+    (let ((last-bid (get-last-bid auction-id lot-index)))
+      (let ((accepted-bid (>= xusd (/ (get debt-to-raise auction) (get lots auction)))))
+        ;; if this bid is at least (total debt to raise / lot-size) amount, accept it as final - we don't need to be greedy
+        (begin
+          ;; (return-collateral (get owner last-bid) (get xusd last-bid))
+          (if (unwrap-panic (contract-call? .xusd-token transfer auction-reserve xusd))
+            (begin
+              (map-set auctions
+                { id: auction-id }
+                {
+                  id: auction-id,
+                  collateral-amount: (get collateral-amount auction),
+                  debt-to-raise: (get debt-to-raise auction),
+                  vault-id: (get vault-id auction),
+                  lot-size: (get lot-size auction),
+                  lots: (get lots auction),
+                  last-lot-size: (get last-lot-size auction),
+                  lots-sold: (+ u1 (get lots-sold auction)),
+                  ends-at: (get ends-at auction),
+                  total-collateral-auctioned: (- (+ collateral-amount (get total-collateral-auctioned auction)) (get collateral-amount last-bid)),
+                  total-debt-raised: (- (+ xusd (get total-debt-raised auction)) (get xusd last-bid)),
+                  is-open: true
+                }
+              )
+              (map-set bids
+                { auction-id: auction-id, lot-index: lot-index }
+                {
+                  xusd: xusd,
+                  collateral-amount: collateral-amount,
+                  owner: tx-sender,
+                  is-accepted: accepted-bid
+                }
+              )
+              (if
+                (or
+                  (>= block-height (get ends-at auction))
+                  (>= (+ u1 (get lots-sold auction)) (get lots auction))
+                )
+                ;; auction is over - close all bids
+                ;; send collateral to winning bidders
+                (ok (unwrap-panic (close-auction auction-id)))
+                (err u0)
+              )
+            )
+            (err err-xusd-transfer-failed)
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-private (return-collateral (owner principal) (xusd uint))
+  (if (> u0 xusd)
+    (ok (unwrap-panic (as-contract (contract-call? .xusd-token transfer owner xusd))))
+    (err false)
+  )
+)
+
+;; DONE 1. flag auction on map as closed
+;; 2a. go over each lot (0 to lot-size) and send collateral to winning address
+;; 2b. OR allow person to collect collateral from reserve manually
 ;; 3. check if vault debt is covered (sum of xUSD in lots >= debt-to-raise)
 ;; 4. update vault to allow vault owner to withdraw leftover collateral (if any)
-;; 5. if not all vault debt is covered: auction off collateral again
+;; 5. if not all vault debt is covered: auction off collateral again (if any left)
 ;; 6. if not all vault debt is covered and no collateral is left: cover xUSD with gov token
 (define-private (close-auction (auction-id uint))
   (let ((auction (get-auction-by-id auction-id)))
@@ -235,7 +232,6 @@
       { id: auction-id }
       {
         id: auction-id,
-        collateral-type: "stx",
         collateral-amount: (get collateral-amount auction),
         debt-to-raise: (get debt-to-raise auction),
         vault-id: (get vault-id auction),
@@ -245,6 +241,7 @@
         lots-sold: (get lots-sold auction),
         ends-at: (get ends-at auction),
         total-collateral-auctioned: (get total-collateral-auctioned auction),
+        total-debt-raised: (get total-debt-raised auction),
         is-open: false
       }
     )
